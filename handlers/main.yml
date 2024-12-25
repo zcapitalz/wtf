@@ -1,0 +1,13 @@
+---
+- name: "restart openvpn"
+  become: true
+  service: 
+    name: openvpn
+    state: restarted
+
+- name: "enable openvpn"
+  become: true
+  service: 
+    name: openvpn
+    state: started
+    enabled: yes

@@ -1,0 +1,257 @@
+---
+- name: Install required packages
+  apt:
+    pkg:
+      - openvpn
+      - easy-rsa
+      - iptables-persistent
+    state: present
+    update_cache: true
+  become: true
+  notify:
+    - "enable openvpn"
+
+- name: Enable IPv4 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: yes
+    state: present
+    reload: yes
+  ignore_errors: true  # Correcting "ignoreerrors" to "ignore_errors"
+  failed_when: false
+
+- name: Create IPTables NAT Chain
+  iptables:
+    table: nat
+    chain: POSTROUTING
+    action: append
+    jump: MASQUERADE
+    source: '0.0.0.0/0'
+    destination: '0.0.0.0/0'
+    comment: Ansible NAT Masquerade
+  become: true  # Ensure elevated privileges
+
+- name: "Ensure {{ openvpn_dir }}/easy-rsa exists"
+  file:
+    path: "{{ openvpn_dir }}/easy-rsa"
+    state: directory
+    mode: '0755'
+
+- name: Initialize PKI with EasyRSA
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa init-pki"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki"
+
+- name: Build Certificate Authority
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa build-ca nopass"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/ca.crt"
+  environment: 
+    EASYRSA_BATCH: "yes"
+    
+- name: Register CA certificate content
+  slurp:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/ca.crt"
+  register: openvpn_ca_cert
+
+- name: Generate Diffie-Hellman parameters
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa gen-dh"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/dh.pem"
+
+- name: Generate Server Certificate
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa build-server-full server nopass"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/issued/server.crt"
+
+- name: Generate Client Certificates
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa build-client-full {{ item }} nopass"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/issued/{{ item }}.crt"
+  loop: "{{ openvpn_clients }}"  
+
+- name: Generate Certificate Revocation List
+  command:
+    cmd: "{{ easy_rsa_dir }}/easyrsa gen-crl"
+    chdir: "{{ openvpn_dir }}/easy-rsa"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/crl.pem"
+
+- name: Generate TLS Key
+  command:
+    cmd: "openvpn --genkey --secret {{ openvpn_dir }}/easy-rsa/pki/ta.key"
+    creates: "{{ openvpn_dir }}/easy-rsa/pki/ta.key"
+    
+    
+- name: Check if TLS Key exists
+  stat:
+    path: "{{ openvpn_dir }}/easy-rsa/pki/ta.key"
+  register: tls_key_check
+
+- name: Fail if TLS Key is missing
+  fail:
+    msg: "TLS Key (ta.key) is missing!"
+  when: not tls_key_check.stat.exists
+
+- name: Register TLS Key content
+  slurp:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/ta.key"
+  register: openvpn_tls_auth
+  
+- name: Register client certificates
+  slurp:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/issued/{{ item }}.crt"
+  loop: "{{ openvpn_clients }}"
+  register: openvpn_client_certs
+
+- name: Register client keys
+  slurp:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/private/{{ item }}.key"
+  loop: "{{ openvpn_clients }}"
+  register: openvpn_client_keys
+
+- name: Ensure IP forwarding is enabled
+  command:
+    cmd: "sysctl -w net.ipv4.ip_forward=1"
+    
+
+- name: Copy necessary files to server directory
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/{{ item }}"
+    dest: "{{ openvpn_dir }}/server/{{ item | basename }}"
+    mode: "0644"
+    remote_src: true
+  loop:
+    - ca.crt
+    - dh.pem
+    - ta.key
+    - private/ca.key
+    - private/server.key
+    - issued/server.crt
+
+- name: Copy files to OpenVPN directory
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/{{ item }}"
+    dest: "{{ openvpn_dir }}/{{ item | basename }}"
+    mode: "0640"
+    remote_src: true
+  loop:
+    - ca.crt
+    - ta.key
+
+- name: Deploy server.conf
+  template:
+    src: "../templates/server.conf.j2"
+    dest: "{{ openvpn_dir }}/server.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - restart openvpn
+
+- name: Copy client certificate files to server
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/issued/{{ item }}.crt"
+    dest: "{{ openvpn_dir }}/server/{{ item }}.crt"
+    mode: "0644"
+    remote_src: true
+  loop: "{{ openvpn_clients }}"
+
+- name: Copy client key files to server
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/private/{{ item }}.key"
+    dest: "{{ openvpn_dir }}/server/{{ item }}.key"
+    mode: "0644"
+    remote_src: true
+  loop: "{{ openvpn_clients }}"
+
+- name: Ensure users directory exists
+  file:
+    path: "{{ openvpn_dir }}/users"
+    state: directory
+    mode: '0755'
+
+- name: Copy files to users directory
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/{{ item }}"
+    dest: "{{ openvpn_dir }}/users/{{ item | basename }}"
+    mode: "0640"
+    remote_src: true
+  loop:
+    - ca.crt
+    - ta.key
+
+- name: Copy client certificate files to users directory
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/issued/{{ item }}.crt"
+    dest: "{{ openvpn_dir }}/users/{{ item }}.crt"
+    mode: "0644"
+    remote_src: true
+  loop: "{{ openvpn_clients }}"
+
+- name: Copy client key files to users directory
+  copy:
+    src: "{{ openvpn_dir }}/easy-rsa/pki/private/{{ item }}.key"
+    dest: "{{ openvpn_dir }}/users/{{ item }}.key"
+    mode: "0644"
+    remote_src: true
+  loop: "{{ openvpn_clients }}"
+  
+- name: Debug client certificates structure
+  debug:
+    var: openvpn_client_certs
+
+- name: Debug client keys structure
+  debug:
+    var: openvpn_client_keys
+
+  
+- name: Set client certificate and key facts
+  set_fact:
+    ca_cert: "{{ openvpn_ca_cert.content | b64decode }}"
+    tls_key: "{{ openvpn_tls_auth.content | b64decode }}"
+    client_cert: >-
+      {{ (openvpn_client_certs.results | selectattr('item', 'equalto', item) | map(attribute='content') | list)[0] | b64decode }}
+    client_key: >-
+      {{ (openvpn_client_keys.results | selectattr('item', 'equalto', item) | map(attribute='content') | list)[0] | b64decode }}
+  loop: "{{ openvpn_clients }}"
+  loop_control:
+    loop_var: item
+    
+- name: Debug client-specific facts
+  debug:
+    msg:
+      ca_cert: "{{ ca_cert }}"
+      tls_key: "{{ tls_key }}"
+      client_cert: "{{ client_cert }}"
+      client_key: "{{ client_key }}"
+
+- name: Create directory for client configurations
+  file:
+    path: "/etc/openvpn/users/{{ item }}"
+    state: directory
+    mode: '0755'
+  with_items:
+    - "{{ openvpn_clients }}"
+
+
+
+- name: Generate client configuration files
+  template:
+    src: "../templates/client.ovpn.j2"
+    dest: "/etc/openvpn/users/{{ item }}/client.ovpn"
+  loop: "{{ openvpn_clients }}"
+  loop_control:
+    loop_var: item
+
+  
+- name: Fetch client configuration files
+  fetch:
+    src: "/etc/openvpn/users/{{ item }}/client.ovpn"
+    dest: "ovpn/{{ item }}.ovpn"
+  loop: "{{ openvpn_clients }}"
